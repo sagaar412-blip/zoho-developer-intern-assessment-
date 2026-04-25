@@ -495,7 +495,6 @@ function startMotionDetection(){
 
 function scheduleAI(trigger){
   if(isRunningAI||terminated)return;
-  aiCooldown=true;setTimeout(()=>aiCooldown=false,10000);
   runProctorAI(trigger);
 }
 
@@ -508,10 +507,10 @@ async function runProctorAI(trigger){
   if(!v||!v.srcObject||v.readyState<2){isRunningAI=false;return}
 
   // Capture current frame at decent resolution
-  const tmp=document.createElement('canvas');tmp.width=480;tmp.height=360;
+  const tmp=document.createElement('canvas');tmp.width=640;tmp.height=480;
   const tctx=tmp.getContext('2d');
-  tctx.save();tctx.scale(-1,1);tctx.drawImage(v,-480,0,480,360);tctx.restore();
-  const currentB64=tmp.toDataURL('image/jpeg',.85).split(',')[1];
+  tctx.save();tctx.scale(-1,1);tctx.drawImage(v,-640,0,640,480);tctx.restore();
+  const currentB64=tmp.toDataURL('image/jpeg',.92).split(',')[1];
 
   try{
     const content=[];
@@ -521,20 +520,23 @@ async function runProctorAI(trigger){
       content.push({type:'image',source:{type:'base64',media_type:'image/jpeg',data:baselineFaceB64}});
       // Image 2: current frame
       content.push({type:'image',source:{type:'base64',media_type:'image/jpeg',data:currentB64}});
-      content.push({type:'text',text:`You are a strict exam proctoring AI.
+      content.push({type:'text',text:`You are a STRICT exam proctoring AI performing identity verification.
 
-IMAGE 1 = the REGISTERED candidate's baseline photo taken at exam start.
-IMAGE 2 = the CURRENT live camera frame during the exam.
+IMAGE 1 = BASELINE photo of the registered candidate (taken at exam start).
+IMAGE 2 = CURRENT live camera frame.
 
-Your job: Compare the TWO faces carefully and determine if it is the SAME person.
+Compare the faces in both images very carefully.
+Consider: face shape, skin tone, hair color/style, eye shape, nose shape, jawline, gender, approximate age.
 
-Look at: face shape, skin tone, hair, eyes, nose, jawline, gender, age.
-Be STRICT — if you are not at least 85% confident it is the same person, mark same_person as false.
-If IMAGE 2 has no face visible, set face_count to 0.
-If IMAGE 2 has multiple people, set multiple_people to true.
+IMPORTANT RULES:
+- If the faces are CLEARLY the same person → same_person: true, confidence: 85-100
+- If there is ANY doubt or the faces look different → same_person: false, confidence: 0-84
+- If no face is visible in IMAGE 2 → face_count: 0
+- Different lighting or angle is NOT a reason to say different person
+- Different person entirely (different gender, different face) → same_person: false
 
-Respond ONLY with this exact JSON, no explanation, no markdown:
-{"face_count":0,"same_person":true,"multiple_people":false,"confidence":0,"phone_or_notes":false,"looking_away":false,"msg":""}`});
+Return ONLY this JSON, absolutely nothing else:
+{"face_count":1,"same_person":true,"multiple_people":false,"confidence":90,"phone_or_notes":false,"looking_away":false,"msg":""}`});
     } else {
       // No baseline yet — just basic checks
       content.push({type:'image',source:{type:'base64',media_type:'image/jpeg',data:currentB64}});
@@ -566,7 +568,7 @@ Respond ONLY with this exact JSON, no explanation, no markdown:
     console.log('Proctor AI result:',r);
 
     // ── IDENTITY MISMATCH LOGIC (2 warnings then terminate) ────
-    if(baselineFaceB64 && r.face_count>0 && r.same_person===false && r.confidence<85){
+    if(baselineFaceB64 && r.face_count>0 && (r.same_person===false || r.confidence<85)){
       identityWarningCount++;
       const snap=await captureSnapshot(`identity_mismatch_warning_${identityWarningCount}`);
       proctorLog.push({time:new Date().toLocaleTimeString('en-IN'),type:'IDENTITY_MISMATCH',
