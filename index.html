@@ -258,11 +258,17 @@ let answers=Array(30).fill('');
 let violations=0, proctorActive=false, proctorLog=[], snapshots=[];
 let camGranted=false, camStream=null;
 let motionCtx=null, lastFrameData=null, motionInt=null, periodicInt=null, periodicSnapInt=null;
-let aiCooldown=false, isRunningAI=false, camBlockCooldown=false, moveCooldown=false;
+let isRunningAI=false, moveCooldown=false;
 let snapshotSeq=0;
-// Identity mismatch warning system — 2 warnings then terminate
+// Identity mismatch — 2 warnings then terminate
 let identityWarningCount=0;
 const MAX_IDENTITY_WARNINGS=2;
+// Face not visible tracking — 3 strikes then terminate
+let faceNotVisibleStart=null;   // timestamp when face first disappeared
+let faceNotVisibleStrikes=0;    // how many times 2s limit was exceeded
+const MAX_FACE_STRIKES=3;       // after 3 strikes → terminate
+const FACE_ABSENT_LIMIT_MS=2000;// 2 seconds grace
+let faceCheckInt=null;          // dedicated face presence interval
 let schemaCollapsed=false;
 let baselineFaceB64=null;  // reference photo taken before exam starts
 let faceCheckCooldown=false;
@@ -681,9 +687,11 @@ function updateCamUI(ok){
     :`<div class="cicon">📷</div><div><h4 style="color:var(--red)">Camera access denied</h4><p>Required to proceed.<br><button class="btn btn-ghost" style="margin-top:6px;font-size:11px;padding:5px 12px" onclick="startCam()">Try Again</button></p></div>`;
 }
 function stopCam(){
-  clearInterval(motionInt);clearInterval(periodicInt);clearInterval(periodicSnapInt);
+  clearInterval(motionInt);clearInterval(periodicInt);
+  clearInterval(periodicSnapInt);clearInterval(faceCheckInt);
   if(camStream)camStream.getTracks().forEach(t=>t.stop());
   document.getElementById('cam-pip').style.display='none';
+  hideFaceWarningBar();
 }
 
 // ── TIMER ──────────────────────────────────────────────────────
