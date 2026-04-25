@@ -259,7 +259,10 @@ let violations=0, proctorActive=false, proctorLog=[], snapshots=[];
 let camGranted=false, camStream=null;
 let motionCtx=null, lastFrameData=null, motionInt=null, periodicInt=null, periodicSnapInt=null;
 let aiCooldown=false, isRunningAI=false, camBlockCooldown=false, moveCooldown=false;
-let snapshotSeq=0; // sequential counter for naming
+let snapshotSeq=0;
+// Identity mismatch warning system — 2 warnings then terminate
+let identityWarningCount=0;
+const MAX_IDENTITY_WARNINGS=2;
 let schemaCollapsed=false;
 let baselineFaceB64=null;  // reference photo taken before exam starts
 let faceCheckCooldown=false;
@@ -486,8 +489,8 @@ function startMotionDetection(){
       lastFrameData=new Uint8ClampedArray(curr.data);
     }catch(e){}
   },500);
-  // Periodic face identity check every 30s
-  periodicInt=setInterval(()=>{if(!isRunningAI&&!terminated)scheduleAI('periodic')},30000);
+  // Face identity check every 5s — fast catch
+  periodicInt=setInterval(()=>{if(!isRunningAI&&!terminated)scheduleAI('periodic')},5000);
 }
 
 function scheduleAI(trigger){
@@ -496,65 +499,159 @@ function scheduleAI(trigger){
   runProctorAI(trigger);
 }
 
-// ── AI PROCTOR CHECK (with identity comparison) ────────────────
+// ── AI PROCTOR CHECK (strict identity with 2-warning system) ───
 async function runProctorAI(trigger){
   if(!camGranted||!proctorActive||isRunningAI||terminated)return;
   isRunningAI=true;
-  // Capture current frame
+
   const v=document.getElementById('camvid');
   if(!v||!v.srcObject||v.readyState<2){isRunningAI=false;return}
-  const tmp=document.createElement('canvas');tmp.width=320;tmp.height=240;
+
+  // Capture current frame at decent resolution
+  const tmp=document.createElement('canvas');tmp.width=480;tmp.height=360;
   const tctx=tmp.getContext('2d');
-  tctx.save();tctx.scale(-1,1);tctx.drawImage(v,-320,0,320,240);tctx.restore();
-  const currentB64=tmp.toDataURL('image/jpeg',.65).split(',')[1];
+  tctx.save();tctx.scale(-1,1);tctx.drawImage(v,-480,0,480,360);tctx.restore();
+  const currentB64=tmp.toDataURL('image/jpeg',.85).split(',')[1];
 
   try{
-    const content=[
-      {type:'image',source:{type:'base64',media_type:'image/jpeg',data:currentB64}},
-    ];
-    // If we have baseline, include it for comparison
+    const content=[];
+
     if(baselineFaceB64){
-      content.unshift({type:'image',source:{type:'base64',media_type:'image/jpeg',data:baselineFaceB64}});
-      content.push({type:'text',text:`First image = BASELINE (registered candidate). Second image = CURRENT camera frame.
-Proctor check [${trigger}]. Carefully compare both faces.
-Return ONLY JSON (no extra text):
-{"face_count":0,"same_person":true,"multiple_people":false,"phone_or_notes":false,"phone_near_ear":false,"left_seat":false,"looking_away":false,"suspicious":false,"type":"none","msg":""}`});
-    }else{
-      content.push({type:'text',text:`Proctor check [${trigger}]. Return ONLY JSON:
-{"face_count":0,"same_person":true,"multiple_people":false,"phone_or_notes":false,"phone_near_ear":false,"left_seat":false,"looking_away":false,"suspicious":false,"type":"none","msg":""}`});
+      // Image 1: baseline reference
+      content.push({type:'image',source:{type:'base64',media_type:'image/jpeg',data:baselineFaceB64}});
+      // Image 2: current frame
+      content.push({type:'image',source:{type:'base64',media_type:'image/jpeg',data:currentB64}});
+      content.push({type:'text',text:`You are a strict exam proctoring AI.
+
+IMAGE 1 = the REGISTERED candidate's baseline photo taken at exam start.
+IMAGE 2 = the CURRENT live camera frame during the exam.
+
+Your job: Compare the TWO faces carefully and determine if it is the SAME person.
+
+Look at: face shape, skin tone, hair, eyes, nose, jawline, gender, age.
+Be STRICT — if you are not at least 85% confident it is the same person, mark same_person as false.
+If IMAGE 2 has no face visible, set face_count to 0.
+If IMAGE 2 has multiple people, set multiple_people to true.
+
+Respond ONLY with this exact JSON, no explanation, no markdown:
+{"face_count":0,"same_person":true,"multiple_people":false,"confidence":0,"phone_or_notes":false,"looking_away":false,"msg":""}`});
+    } else {
+      // No baseline yet — just basic checks
+      content.push({type:'image',source:{type:'base64',media_type:'image/jpeg',data:currentB64}});
+      content.push({type:'text',text:`You are an exam proctoring AI. Check this camera frame.
+Respond ONLY with this exact JSON, no explanation, no markdown:
+{"face_count":0,"same_person":true,"multiple_people":false,"confidence":100,"phone_or_notes":false,"looking_away":false,"msg":""}`});
     }
 
-    const body=JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:180,messages:[{role:'user',content}]});
-    const hdrs={'Content-Type':'application/json','anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-calls':'true'};
+    const hdrs={
+      'Content-Type':'application/json',
+      'anthropic-version':'2023-06-01',
+      'anthropic-dangerous-direct-browser-calls':'true'
+    };
+    const body=JSON.stringify({
+      model:'claude-sonnet-4-20250514',
+      max_tokens:200,
+      messages:[{role:'user',content}]
+    });
+
     let pr;
     try{pr=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:hdrs,body})}
     catch(e){pr=await fetch('https://corsproxy.io/?https://api.anthropic.com/v1/messages',{method:'POST',headers:hdrs,body})}
+
     const pd=await pr.json();
     const raw=(pd.content?.[0]?.text||'{}').replace(/```json|```/g,'').trim();
-    const r=JSON.parse(raw);
+    let r;
+    try{r=JSON.parse(raw)}catch(e){console.warn('AI parse fail:',raw);isRunningAI=false;return}
 
-    // ── CRITICAL: Identity mismatch → TERMINATE ──
-    if(baselineFaceB64&&r.same_person===false&&r.face_count>0){
-      proctorLog.push({time:new Date().toLocaleTimeString('en-IN'),type:'IDENTITY_MISMATCH',msg:'Different person detected — exam terminated.'});
-      await terminateExam('identity_mismatch','A different person was detected on camera. This is the most serious violation. Your exam has been terminated and the incident has been flagged for review by the recruitment team.');
+    console.log('Proctor AI result:',r);
+
+    // ── IDENTITY MISMATCH LOGIC (2 warnings then terminate) ────
+    if(baselineFaceB64 && r.face_count>0 && r.same_person===false && r.confidence<85){
+      identityWarningCount++;
+      const snap=await captureSnapshot(`identity_mismatch_warning_${identityWarningCount}`);
+      proctorLog.push({time:new Date().toLocaleTimeString('en-IN'),type:'IDENTITY_MISMATCH',
+        msg:`Different person detected (warning ${identityWarningCount}/${MAX_IDENTITY_WARNINGS}). Confidence: ${r.confidence}%`});
+
+      if(identityWarningCount>=MAX_IDENTITY_WARNINGS){
+        // 2 warnings done — TERMINATE NOW
+        await terminateExam('identity_mismatch',
+          `A different person was detected on camera ${MAX_IDENTITY_WARNINGS} times. This is the most serious violation. Your exam has been terminated immediately and all captured evidence has been sent to the recruitment team.`);
+        return;
+      } else {
+        // First warning — show big red alert, don't terminate yet
+        showIdentityWarning(identityWarningCount);
+      }
+      isRunningAI=false;
       return;
     }
 
-    let vmsg='';
-    if(r.face_count===0)vmsg='No face detected — stay visible on camera.';
-    else if(r.multiple_people)vmsg='Multiple people detected — serious violation.';
-    else if(r.phone_near_ear){vmsg='Phone near ear detected — unauthorized.';captureSnapshot('phone_near_ear');}
-    else if(r.phone_or_notes){vmsg='Unauthorized materials detected.';captureSnapshot('unauthorized_materials');}
-    else if(r.left_seat){vmsg='You appear to have left your seat.';captureSnapshot('left_seat');}
-    else if(r.looking_away)vmsg='Keep your eyes on the screen.';
-    else if(r.suspicious){vmsg=r.msg||'Suspicious behavior detected.';captureSnapshot('suspicious');}
-
-    if(vmsg){
-      proctorLog.push({time:new Date().toLocaleTimeString('en-IN'),type:r.type||'ai_flag',msg:vmsg});
-      showAlert('⚠️ '+vmsg);
+    // ── If same person confirmed — reset warning count ─────────
+    if(r.same_person===true && r.face_count>0){
+      // Only reset if confidently same person
+      if(r.confidence>=85) identityWarningCount=0;
     }
-  }catch(e){console.warn('AI proctor:',e)}
+
+    // ── OTHER VIOLATION CHECKS ─────────────────────────────────
+    let vmsg='';
+    if(r.face_count===0){
+      vmsg='No face detected — stay visible on camera.';
+      captureSnapshot('no_face_detected');
+    } else if(r.multiple_people){
+      vmsg='Multiple people detected — serious violation!';
+      captureSnapshot('multiple_people');
+      proctorLog.push({time:new Date().toLocaleTimeString('en-IN'),type:'multiple_people',msg:vmsg});
+    } else if(r.phone_or_notes){
+      vmsg='Unauthorized materials (phone/notes) detected!';
+      captureSnapshot('unauthorized_materials');
+      proctorLog.push({time:new Date().toLocaleTimeString('en-IN'),type:'phone_or_notes',msg:vmsg});
+    } else if(r.looking_away){
+      vmsg='Keep your eyes on the screen.';
+    }
+
+    if(vmsg) showAlert('⚠️ '+vmsg);
+
+  }catch(e){console.warn('AI proctor error:',e)}
   finally{isRunningAI=false}
+}
+
+// ── BIG RED IDENTITY WARNING POPUP ────────────────────────────
+function showIdentityWarning(warnNum){
+  // Remove any existing warning
+  document.getElementById('identity-warn-overlay')?.remove();
+  const remaining=MAX_IDENTITY_WARNINGS-warnNum;
+  const div=document.createElement('div');
+  div.id='identity-warn-overlay';
+  div.style.cssText=`position:fixed;inset:0;z-index:99998;background:rgba(0,0,0,.92);
+    display:flex;flex-direction:column;align-items:center;justify-content:center;
+    text-align:center;padding:30px;backdrop-filter:blur(10px)`;
+  div.innerHTML=`
+    <div style="font-size:72px;margin-bottom:10px">🚨</div>
+    <h1 style="font-size:26px;font-weight:900;color:#f43f5e;margin-bottom:10px">
+      Identity Mismatch — Warning ${warnNum}/${MAX_IDENTITY_WARNINGS}
+    </h1>
+    <p style="font-size:15px;color:#94a3b8;max-width:460px;line-height:1.8;margin-bottom:8px">
+      The person on camera does not match the registered candidate.<br>
+      <strong style="color:#f87171">This has been photographed and logged.</strong>
+    </p>
+    <p style="font-size:14px;color:#fbbf24;margin-bottom:24px">
+      ⚠️ ${remaining} more violation${remaining!==1?'s':''} will result in <strong>immediate exam termination.</strong>
+    </p>
+    <div style="background:rgba(244,63,94,.1);border:1px solid rgba(244,63,94,.3);border-radius:10px;
+      padding:12px 24px;font-size:13px;color:#fca5a5;margin-bottom:24px;max-width:400px">
+      The registered candidate must return to the camera immediately.
+    </div>
+    <button onclick="dismissIdentityWarning()" style="background:linear-gradient(135deg,#6366f1,#8b5cf6);
+      color:#fff;border:none;padding:13px 36px;border-radius:8px;font-size:15px;font-weight:700;
+      cursor:pointer;font-family:inherit">
+      I Understand — Resume Exam
+    </button>`;
+  document.body.appendChild(div);
+  // Auto-dismiss after 20 seconds
+  setTimeout(()=>div.remove(),20000);
+}
+
+function dismissIdentityWarning(){
+  document.getElementById('identity-warn-overlay')?.remove();
 }
 
 function showAlert(msg){
